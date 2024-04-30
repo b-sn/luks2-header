@@ -25,6 +25,8 @@ const (
 	minHeaderSize = 16384
 )
 
+var possibleSecondHeaderOffset = [9]int{16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304}
+
 type LUKSBinaryHeader struct {
 	Magic        [6]byte
 	HeaderNumber uint
@@ -224,17 +226,42 @@ func main() {
 
 	var headerStartSeek int64 = 0
 
-	binHeader := readBinaryHeader(file, headerStartSeek)
-	if binHeader.HeaderNumber == 0 {
-		log.Fatal("Header not found. Exiting.")
+	log.Println("INFO: Reading first LUKS binary header")
+	firstBinHeader := readBinaryHeader(file, headerStartSeek)
+	switch firstBinHeader.Version {
+	case 1:
+		log.Fatalln("ERROR: LUKS1 is not supported")
+	case 2:
+		log.Println("INFO: Reading first LUKS2 JSON header")
+	default:
+		log.Println("WARN: First LUKS2 binary header not found")
+		// FIXME: Try to find the second header
 	}
-	fmt.Println(binHeader)
-
-	if binHeader.Version == 2 {
-		jsonHeader := readJSONHeader(file, headerStartSeek+jsonOffset, binHeader.HdrSize)
-		fmt.Println(jsonHeader)
+	hdrSizes := make([]uint64, 0, len(possibleSecondHeaderOffset))
+	if binHeader.HdrSize > 0 {
+		hdrSizes = append(hdrSizes, binHeader.HdrSize)
+	} else {
+		hdrSizes = possibleSecondHeaderOffset
 	}
 
+	var firstJsonHeader LUKSJSONHeader
+	for _, hdrSize := range hdrSizes {
+		firstJsonHeader, err = readJSONHeader(file, headerStartSeek+jsonOffset, hdrSize)
+		if err == nil {
+			break
+		}
+	}
+
+	log.Println("INFO: Reading second LUKS binary header")
+		for _, offset := range possibleSecondHeaderOffset {
+			binHeader = readBinaryHeader(file, int64(offset))
+			if binHeader.HeaderNumber != 0 {
+				headerStartSeek = int64(offset)
+				break
+			}
+		}
+	}
+	// fmt.Println(binHeader)
 }
 
 func mustRead(file *os.File, length int) []byte {
@@ -256,7 +283,7 @@ func readBinaryHeader(file *os.File, offset int64) LUKSBinaryHeader {
 	// Read the first 6 binary bytes from the file
 	headerMagic := mustRead(file, magicLen)
 	if string(headerMagic) != magic1st && string(headerMagic) != magic2nd {
-		fmt.Println("Not a LUKS header. Magic bytes mismatch.")
+		log.Println("Not a LUKS header. Magic bytes mismatch. Binary header not found")
 		return LUKSBinaryHeader{}
 	}
 
@@ -291,20 +318,17 @@ func readJSONHeader(file *os.File, offset int64, hdrSize uint64) LUKSJSONHeader 
 		fmt.Printf("Error seeking file: %v\n", err)
 	}
 
-	if hdrSize < minHeaderSize {
-		hdrSize = minHeaderSize
-	}
 	readSize := hdrSize - jsonOffset
-
 	headerRaw := InitLUKSHeaderRaw(mustRead(file, int(readSize)))
 
 	res := LUKSJSONHeader{}
 	if err := json.Unmarshal(headerRaw.ReadUntilZeroChar(), &res); err != nil {
-		fmt.Printf("Error unmarshalling JSON header: %v\n", err)
-		fmt.Println("Raw JSON: ", string(headerRaw.Data))
+		// fmt.Printf("Error unmarshalling JSON header: %v\n", err)
+		return res, err
+		// fmt.Println("Raw JSON: ", string(headerRaw.Data))
 	}
 
-	return res
+	return res, nil
 }
 
 type LUKSRawHeader struct {
