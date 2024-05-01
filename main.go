@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -25,7 +26,15 @@ const (
 	minHeaderSize = 16384
 )
 
-var possibleSecondHeaderOffset = [9]int{16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304}
+var possibleHeaderOffset = [9]uint64{16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304}
+
+type readHeaderError error
+
+var (
+	ErrUnsuppLUKS1 = readHeaderError(fmt.Errorf("LUKS1 is not supported"))
+	ErrBinHeader   = readHeaderError(fmt.Errorf("Binary header not found"))
+	ErrJSONHeader  = readHeaderError(fmt.Errorf("JSON header not found"))
+)
 
 type LUKSBinaryHeader struct {
 	Magic        [6]byte
@@ -175,9 +184,6 @@ type KeySlotsS struct {
 func (k KeySlotsS) String() string {
 	return fmt.Sprintf("{\n\t\t\tType: %s\n\t\t\tKeySize: %d\n\t\t\tArea: %+v\n\t\t\tKdf: %+v\n\t\t}",
 		k.Type, k.KeySize, k.Area, k.Kdf)
-
-	// return fmt.Sprintf("{\n\t\t\tType: %s\n\t\t\tKeySize: %d\n\t\t\tAf: %+v\n\t\t\tArea: %+v\n\t\t\tKdf: %+v\n\t\t}",
-	// 	k.Type, k.KeySize, k.Af, k.Area, k.Kdf)
 }
 
 type SegmentsS struct {
@@ -206,88 +212,117 @@ func (t TokensS) String() string {
 }
 
 func main() {
+	log.SetFlags(log.Lmsgprefix)
 	// Get the cli attributes
 	args := os.Args
 	if len(args) < 2 {
-		log.Fatal("No file name provided. Exiting.")
+		log.Fatalf("Usage: %s <file>\n", args[0])
 	}
 
-	// Get the file name from the cli
-	fileName := args[1]
-
-	// Open the file in read mode
-	file, err := os.Open(fileName)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Close the file after the function ends
+	file := NewFileReader(args[1])
 	defer file.Close()
 
-	var headerStartSeek int64 = 0
-
-	log.Println("INFO: Reading first LUKS binary header")
-	firstBinHeader := readBinaryHeader(file, headerStartSeek)
-	switch firstBinHeader.Version {
-	case 1:
-		log.Fatalln("ERROR: LUKS1 is not supported")
-	case 2:
-		log.Println("INFO: Reading first LUKS2 JSON header")
-	default:
-		log.Println("WARN: First LUKS2 binary header not found")
-		// FIXME: Try to find the second header
+	binHeader1, jsonHeader1, err1 := readHeaders(file, 0)
+	if !errors.Is(err1, ErrBinHeader) {
+		log.Println("INFO: First LUKS binary header found")
+		log.Println(binHeader1)
+	} else {
+		log.Println("WARN: First binary header not found")
 	}
-	hdrSizes := make([]uint64, 0, len(possibleSecondHeaderOffset))
-	if binHeader.HdrSize > 0 {
+	if !errors.Is(err1, ErrJSONHeader) {
+		log.Println("INFO: First LUKS JSON header found")
+		log.Println(jsonHeader1)
+	} else {
+		log.Println("WARN: First JSON header not found")
+	}
+
+	hdr1Sizes := make([]uint64, 0, len(possibleHeaderOffset))
+	if binHeader1.Version == 2 && binHeader1.HdrSize > 0 {
+		hdr1Sizes = append(hdr1Sizes, binHeader1.HdrSize)
+	} else {
+		hdr1Sizes = possibleHeaderOffset[:]
+	}
+
+	var binHeader2 LUKSBinaryHeader
+	var jsonHeader2 LUKSJSONHeader
+	var err2 error
+	for _, hdrSize := range hdr1Sizes {
+		binHeader2, jsonHeader2, err2 = readHeaders(file, int64(hdrSize))
+		if !errors.Is(err2, ErrBinHeader) || !errors.Is(err2, ErrJSONHeader) {
+			break
+		}
+	}
+	if !errors.Is(err2, ErrBinHeader) {
+		log.Println("INFO: Second LUKS binary header found")
+		log.Println(binHeader2)
+	} else {
+		log.Println("WARN: Second binary header not found")
+	}
+	if !errors.Is(err2, ErrJSONHeader) {
+		log.Println("INFO: Second LUKS JSON header found")
+		log.Println(jsonHeader2)
+	} else {
+		log.Println("WARN: Second JSON header not found")
+	}
+
+	if errors.Is(err1, ErrJSONHeader) && errors.Is(err2, ErrJSONHeader) {
+		log.Fatalln("No JSON headers found. Header can't be restored")
+	}
+
+	fmt.Printf("\nInput file name to save header: ")
+	var restoredHeaderFileName string
+	fmt.Scan(&restoredHeaderFileName)
+
+	if errors.Is(err1, ErrBinHeader) && errors.Is(err2, ErrBinHeader) {
+		// We need luks disk UUID
+	}
+}
+
+func readHeaders(file *fileReader, headerOffset int64) (LUKSBinaryHeader, LUKSJSONHeader, error) {
+	var resErr error
+
+	// Read the binary header
+	binHeader := readBinaryHeader(file, headerOffset)
+	switch binHeader.Version {
+	case 0:
+		resErr = errors.Join(resErr, ErrBinHeader)
+	case 1:
+		resErr = errors.Join(resErr, ErrUnsuppLUKS1)
+	}
+
+	// Collect possible header sizes
+	hdrSizes := make([]uint64, 0, len(possibleHeaderOffset))
+	if binHeader.Version == 2 && binHeader.HdrSize > 0 {
 		hdrSizes = append(hdrSizes, binHeader.HdrSize)
 	} else {
-		hdrSizes = possibleSecondHeaderOffset
+		hdrSizes = possibleHeaderOffset[:]
 	}
 
-	var firstJsonHeader LUKSJSONHeader
+	// Read the JSON header
+	var jsonHeader LUKSJSONHeader
+	var err error
 	for _, hdrSize := range hdrSizes {
-		firstJsonHeader, err = readJSONHeader(file, headerStartSeek+jsonOffset, hdrSize)
+		// fmt.Printf("Trying to read JSON header starting from %d with size %d\n", headerOffset+jsonOffset, hdrSize-jsonOffset)
+		jsonHeader, err = readJSONHeader(file, headerOffset+jsonOffset, int64(hdrSize)-jsonOffset)
 		if err == nil {
 			break
 		}
 	}
-
-	log.Println("INFO: Reading second LUKS binary header")
-		for _, offset := range possibleSecondHeaderOffset {
-			binHeader = readBinaryHeader(file, int64(offset))
-			if binHeader.HeaderNumber != 0 {
-				headerStartSeek = int64(offset)
-				break
-			}
-		}
+	if err != nil {
+		resErr = errors.Join(resErr, ErrJSONHeader)
 	}
-	// fmt.Println(binHeader)
+
+	return binHeader, jsonHeader, resErr
 }
 
-func mustRead(file *os.File, length int) []byte {
-	data := make([]byte, length)
-	_, err := file.Read(data)
-	if err != nil {
-		log.Fatal(fmt.Printf("Error reading file: %v", err))
-	}
-	return data
-}
-
-func readBinaryHeader(file *os.File, offset int64) LUKSBinaryHeader {
-	// Seek to the beginning of the file
-	_, err := file.Seek(offset, 0)
-	if err != nil {
-		fmt.Printf("Error seeking file: %v\n", err)
-	}
-
+func readBinaryHeader(file *fileReader, headerOffset int64) LUKSBinaryHeader {
 	// Read the first 6 binary bytes from the file
-	headerMagic := mustRead(file, magicLen)
+	headerMagic := file.MustReadFrom(headerOffset, magicLen)
 	if string(headerMagic) != magic1st && string(headerMagic) != magic2nd {
-		log.Println("Not a LUKS header. Magic bytes mismatch. Binary header not found")
 		return LUKSBinaryHeader{}
 	}
 
-	headerRaw := InitLUKSHeaderRaw(mustRead(file, binHeaderLen-magicLen))
+	headerRaw := InitLUKSHeaderRaw(file.MustRead(binHeaderLen - magicLen))
 
 	res := LUKSBinaryHeader{
 		Magic:        [6]byte(headerMagic),
@@ -311,21 +346,12 @@ func readBinaryHeader(file *os.File, offset int64) LUKSBinaryHeader {
 	return res
 }
 
-func readJSONHeader(file *os.File, offset int64, hdrSize uint64) LUKSJSONHeader {
-	// Seek to the beginning of the file
-	_, err := file.Seek(offset, 0)
-	if err != nil {
-		fmt.Printf("Error seeking file: %v\n", err)
-	}
-
-	readSize := hdrSize - jsonOffset
-	headerRaw := InitLUKSHeaderRaw(mustRead(file, int(readSize)))
+func readJSONHeader(file *fileReader, offset, hdrSize int64) (LUKSJSONHeader, error) {
+	headerRaw := InitLUKSHeaderRaw(file.MustReadFrom(offset, hdrSize))
 
 	res := LUKSJSONHeader{}
 	if err := json.Unmarshal(headerRaw.ReadUntilZeroChar(), &res); err != nil {
-		// fmt.Printf("Error unmarshalling JSON header: %v\n", err)
-		return res, err
-		// fmt.Println("Raw JSON: ", string(headerRaw.Data))
+		return LUKSJSONHeader{}, err
 	}
 
 	return res, nil
@@ -377,4 +403,62 @@ func (h *LUKSRawHeader) Skip(size int) *LUKSRawHeader {
 func (h *LUKSRawHeader) SkipUpTo(pos int) *LUKSRawHeader {
 	h.Pos = pos
 	return h
+}
+
+type fileReader struct {
+	file *os.File
+	pos  int64
+}
+
+func NewFileReader(fileName string) *fileReader {
+	// Open the file in read mode
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return &fileReader{
+		file: file,
+	}
+}
+
+func (f *fileReader) Seek(offset int64) {
+	var err error
+	f.pos, err = f.file.Seek(offset, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (f *fileReader) read(size int64) []byte {
+	// Read the data
+	data := make([]byte, size)
+	n, err := f.file.Read(data)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Check if the read data is the same as the requested size
+	if int64(n) != size {
+		log.Fatalf("Expected to read %d bytes, but read %d bytes", size, n)
+	}
+
+	f.pos += size
+
+	return data
+}
+
+func (f *fileReader) MustReadFrom(from, size int64) []byte {
+	// Seek to the start position
+	f.Seek(from)
+
+	return f.read(size)
+}
+
+func (f *fileReader) MustRead(size int64) []byte {
+	return f.read(size)
+}
+
+func (f *fileReader) Close() {
+	f.file.Close()
 }
