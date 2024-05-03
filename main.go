@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -24,9 +26,11 @@ const (
 	binHeaderLen  = 512
 	jsonOffset    = 4096
 	minHeaderSize = 16384
+	algoSHA256    = "sha256"
 )
 
 var possibleHeaderOffset = [9]uint64{16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304}
+var luksVers = map[string]uint{magic1st: 1, magic2nd: 2}
 
 type readHeaderError error
 
@@ -34,6 +38,7 @@ var (
 	ErrUnsuppLUKS1 = readHeaderError(fmt.Errorf("LUKS1 is not supported"))
 	ErrBinHeader   = readHeaderError(fmt.Errorf("Binary header not found"))
 	ErrJSONHeader  = readHeaderError(fmt.Errorf("JSON header not found"))
+	ErrInvalidCsum = readHeaderError(fmt.Errorf("Checksum is not valid"))
 )
 
 type LUKSBinaryHeader struct {
@@ -76,6 +81,9 @@ type LUKSBinaryHeader struct {
 	// checksum algorithm tag is shorter than the csum field length, the rest of
 	// this field must be zeroed
 	CheckSum [64]byte
+
+	// Raw binary data
+	Raw []byte
 }
 
 func (h LUKSBinaryHeader) String() string {
@@ -103,12 +111,46 @@ func (h LUKSBinaryHeader) String() string {
 		h.HeaderNumber, h.Version, h.HdrSize, h.SeqId, h.Label, h.CheckSumAlgo, saltBase64, h.UUID, h.Subsystem, h.HdrOffset, checkSumBase64)
 }
 
+// ToRaw converts the binary header to raw binary data
+func (h LUKSBinaryHeader) ToRaw() []byte {
+	raw := make([]byte, binHeaderLen)
+
+	copy(raw, h.Magic[:])                                 // Magick is the first 6 bytes
+	binary.BigEndian.PutUint16(raw[6:8], h.Version)       // Version is 2 bytes
+	binary.BigEndian.PutUint64(raw[8:16], h.HdrSize)      // HdrSize is 8 bytes
+	binary.BigEndian.PutUint64(raw[16:24], h.SeqId)       // SeqId is 8 bytes
+	copy(raw[24:72], []byte(h.Label))                     // Label is 48 bytes
+	copy(raw[72:104], []byte(h.CheckSumAlgo))             // CheckSumAlgo is 32 bytes
+	copy(raw[104:168], h.Salt[:])                         // Salt is 64 bytes
+	copy(raw[168:208], []byte(h.UUID))                    // UUID is 40 bytes
+	copy(raw[208:256], h.Subsystem[:])                    // Subsystem is 48 bytes
+	binary.BigEndian.PutUint64(raw[256:264], h.HdrOffset) // HdrOffset is 8 bytes
+	copy(raw[264:448], make([]byte, 184))                 // Zeroed 184 bytes
+	copy(raw[448:binHeaderLen], h.CheckSum[:])            // CheckSum is 64 bytes
+
+	return raw
+}
+
+type byteSlice []byte
+
+func (b byteSlice) ToStr() string {
+	res := make([]byte, 0, len(b))
+	for _, v := range b {
+		if v == 0 {
+			break
+		}
+		res = append(res, v)
+	}
+	return string(res)
+}
+
 type LUKSJSONHeader struct {
 	Config   ConfigS              `json:"config"`
 	Digests  map[string]DigestsS  `json:"digests"`
 	KeySlots map[string]KeySlotsS `json:"keyslots"`
 	Segments map[string]SegmentsS `json:"segments"`
 	Tokens   map[string]TokensS   `json:"tokens"`
+	Raw      []byte               `json:"-"` // Raw JSON data
 }
 
 func (h LUKSJSONHeader) String() string {
@@ -226,6 +268,11 @@ func main() {
 	if !errors.Is(err1, ErrBinHeader) {
 		log.Println("INFO: First LUKS binary header found")
 		log.Println(binHeader1)
+		if errors.Is(err1, ErrInvalidCsum) {
+			log.Println("WARN: Checksum is not valid")
+		} else {
+			log.Println("INFO: Checksum is valid")
+		}
 	} else {
 		log.Println("WARN: First binary header not found")
 	}
@@ -255,6 +302,11 @@ func main() {
 	if !errors.Is(err2, ErrBinHeader) {
 		log.Println("INFO: Second LUKS binary header found")
 		log.Println(binHeader2)
+		if errors.Is(err2, ErrInvalidCsum) {
+			log.Println("WARN: Checksum is not valid")
+		} else {
+			log.Println("INFO: Checksum is valid")
+		}
 	} else {
 		log.Println("WARN: Second binary header not found")
 	}
@@ -269,20 +321,23 @@ func main() {
 		log.Fatalln("No JSON headers found. Header can't be restored")
 	}
 
-	fmt.Printf("\nInput file name to save header: ")
-	var restoredHeaderFileName string
-	fmt.Scan(&restoredHeaderFileName)
+	// fmt.Printf("\nInput file name to save header: ")
+	// var restoredHeaderFileName string
+	// fmt.Scan(&restoredHeaderFileName)
 
-	if errors.Is(err1, ErrBinHeader) && errors.Is(err2, ErrBinHeader) {
-		// We need luks disk UUID
-	}
+	// if errors.Is(err1, ErrBinHeader) && errors.Is(err2, ErrBinHeader) {
+	// 	// We need luks disk UUID
+	// }
 }
+
+// func calculateChecksum(data []byte) []byte {
+// }
 
 func readHeaders(file *fileReader, headerOffset int64) (LUKSBinaryHeader, LUKSJSONHeader, error) {
 	var resErr error
 
 	// Read the binary header
-	binHeader := readBinaryHeader(file, headerOffset)
+	binHeader := binData2LUKSBinaryHeader(file.MustReadFrom(headerOffset, binHeaderLen))
 	switch binHeader.Version {
 	case 0:
 		resErr = errors.Join(resErr, ErrBinHeader)
@@ -312,35 +367,78 @@ func readHeaders(file *fileReader, headerOffset int64) (LUKSBinaryHeader, LUKSJS
 		resErr = errors.Join(resErr, ErrJSONHeader)
 	}
 
+	if resErr == nil {
+		if !isChecksumValid(binHeader, jsonHeader) {
+			resErr = errors.Join(resErr, ErrInvalidCsum)
+		}
+	}
+
 	return binHeader, jsonHeader, resErr
 }
 
-func readBinaryHeader(file *fileReader, headerOffset int64) LUKSBinaryHeader {
-	// Read the first 6 binary bytes from the file
-	headerMagic := file.MustReadFrom(headerOffset, magicLen)
+func isChecksumValid(binHeader LUKSBinaryHeader, jsonHeader LUKSJSONHeader) bool {
+	expectedCheckSum := binHeader.CheckSum
+
+	binHeader.CheckSum = [64]byte{} // Zero out the checksum
+	var actualCheckSum [64]byte
+
+	// Check sum algorithm
+	if binHeader.CheckSumAlgo == algoSHA256 {
+		binHeaderRaw := binHeader.ToRaw()
+		binHeaderRaw = append(binHeaderRaw, make([]byte, jsonOffset-len(binHeaderRaw))...)
+		jsonHeaderRaw := jsonHeader.Raw
+		jsonHeaderRaw = append(jsonHeaderRaw, make([]byte, binHeader.HdrSize-uint64(len(jsonHeaderRaw)))...)
+		fmt.Printf("Bin header len: %d\n", len(binHeaderRaw))
+		fmt.Printf("JSON header len: %d\n", len(jsonHeaderRaw))
+		checkSum := sha256.Sum256(append(binHeaderRaw, jsonHeaderRaw...))
+		copy(actualCheckSum[:], checkSum[:])
+	} else {
+		fmt.Printf("Checksum algorithm '%s' is not supported\n", binHeader.CheckSumAlgo)
+		fmt.Printf("Supported algorithms: '%s'\n", algoSHA256)
+		fmt.Println([]byte(binHeader.CheckSumAlgo))
+		fmt.Println([]byte(algoSHA256))
+		return false
+	}
+
+	if !bytes.Equal(expectedCheckSum[:], actualCheckSum[:]) {
+		fmt.Printf("Checksum is not valid\n")
+		fmt.Printf("Expected: %v\n", expectedCheckSum)
+		fmt.Printf("Actual: %v\n", actualCheckSum)
+		return false
+	}
+
+	return true
+}
+
+func binData2LUKSBinaryHeader(raw []byte) LUKSBinaryHeader {
+	headerRaw := InitLUKSHeaderRaw(raw)
+
+	headerMagic := headerRaw.Read(magicLen)
 	if string(headerMagic) != magic1st && string(headerMagic) != magic2nd {
 		return LUKSBinaryHeader{}
 	}
-
-	headerRaw := InitLUKSHeaderRaw(file.MustRead(binHeaderLen - magicLen))
 
 	res := LUKSBinaryHeader{
 		Magic:        [6]byte(headerMagic),
 		Version:      binary.BigEndian.Uint16(headerRaw.Read(uint16Len)),
 		HdrSize:      binary.BigEndian.Uint64(headerRaw.Read(uint64Len)),
 		SeqId:        binary.BigEndian.Uint64(headerRaw.Read(uint64Len)),
-		Label:        string(headerRaw.Read(labelLen)),
-		CheckSumAlgo: string(headerRaw.Read(cSumAlgLen)),
+		Label:        headerRaw.Read(labelLen).ToStr(),
+		CheckSumAlgo: headerRaw.Read(cSumAlgLen).ToStr(),
 		Salt:         [64]byte(headerRaw.Read(saltLen)),
-		UUID:         string(headerRaw.Read(uuidLen)),
+		UUID:         headerRaw.Read(uuidLen).ToStr(),
 		Subsystem:    [48]byte(headerRaw.Read(labelLen)),
-		HdrOffset:    binary.BigEndian.Uint64(headerRaw.Skip(184).Read(uint64Len)),
-		CheckSum:     [64]byte(headerRaw.Read(cSumLen)),
-		HeaderNumber: 1,
+		HdrOffset:    binary.BigEndian.Uint64(headerRaw.Read(uint64Len)),
+		CheckSum:     [64]byte(headerRaw.Skip(184).Read(cSumLen)),
+		HeaderNumber: luksVers[string(headerMagic)],
+		Raw:          raw,
 	}
 
-	if string(headerMagic) == magic2nd {
-		res.HeaderNumber = 2
+	tmpRaw := res.ToRaw()
+	if !bytes.Equal(raw, tmpRaw) {
+		fmt.Printf("Warning: Raw data does not match the original data\n")
+		fmt.Printf("Original: %v\n", raw)
+		fmt.Printf("Restored: %v\n", res.ToRaw())
 	}
 
 	return res
@@ -349,10 +447,14 @@ func readBinaryHeader(file *fileReader, headerOffset int64) LUKSBinaryHeader {
 func readJSONHeader(file *fileReader, offset, hdrSize int64) (LUKSJSONHeader, error) {
 	headerRaw := InitLUKSHeaderRaw(file.MustReadFrom(offset, hdrSize))
 
+	rawJSONHeader := headerRaw.ReadUntilZeroChar()
+	// rawJSONHeader := headerRaw.Read(int(hdrSize))
+
 	res := LUKSJSONHeader{}
-	if err := json.Unmarshal(headerRaw.ReadUntilZeroChar(), &res); err != nil {
+	if err := json.Unmarshal(rawJSONHeader, &res); err != nil {
 		return LUKSJSONHeader{}, err
 	}
+	res.Raw = rawJSONHeader
 
 	return res, nil
 }
@@ -369,7 +471,7 @@ func InitLUKSHeaderRaw(data []byte) LUKSRawHeader {
 	}
 }
 
-func (h *LUKSRawHeader) Read(size int) []byte {
+func (h *LUKSRawHeader) Read(size int) byteSlice {
 	// Check if the size is greater than the data length
 	if h.Pos+size > len(h.Data) {
 		fmt.Println("Error reading header: size is greater than the data length.")
@@ -422,7 +524,7 @@ func NewFileReader(fileName string) *fileReader {
 	}
 }
 
-func (f *fileReader) Seek(offset int64) {
+func (f *fileReader) seek(offset int64) {
 	var err error
 	f.pos, err = f.file.Seek(offset, 0)
 	if err != nil {
@@ -450,7 +552,7 @@ func (f *fileReader) read(size int64) []byte {
 
 func (f *fileReader) MustReadFrom(from, size int64) []byte {
 	// Seek to the start position
-	f.Seek(from)
+	f.seek(from)
 
 	return f.read(size)
 }
