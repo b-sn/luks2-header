@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -291,8 +292,6 @@ func main() {
 		log.Println("WARN: First JSON header not found")
 	}
 
-	return
-
 	hdr1Sizes := make([]uint64, 0, len(possibleHeaderOffset))
 	if binHeader1.Version == 2 && binHeader1.HdrSize > 0 {
 		hdr1Sizes = append(hdr1Sizes, binHeader1.HdrSize)
@@ -330,17 +329,94 @@ func main() {
 	if errors.Is(err1, ErrJSONHeader) && errors.Is(err2, ErrJSONHeader) {
 		log.Fatalln("No JSON headers found. Header can't be restored")
 	}
+	var jsonHeader LUKSJSONHeader
+	if !errors.Is(err1, ErrJSONHeader) {
+		jsonHeader = jsonHeader1
+	} else {
+		jsonHeader = jsonHeader2
+	}
 
-	// fmt.Printf("\nInput file name to save header: ")
-	// var restoredHeaderFileName string
-	// fmt.Scan(&restoredHeaderFileName)
+	var luksDiskUUID string
+	if binHeader1.UUID != "" {
+		luksDiskUUID = binHeader1.UUID
+	} else if binHeader2.UUID != "" {
+		luksDiskUUID = binHeader2.UUID
+	} else {
+		// tmplUuid := "00000000-0000-0000-0000-000000000000"
+		fmt.Printf("\nInput LUKS encrypted disk UUID: ")
+		fmt.Scan(&luksDiskUUID)
+	}
 
-	// if errors.Is(err1, ErrBinHeader) && errors.Is(err2, ErrBinHeader) {
-	// 	// We need luks disk UUID
-	// }
+	var SeqId uint64
+	if binHeader1.SeqId > binHeader2.SeqId {
+		SeqId = binHeader1.SeqId
+	} else {
+		SeqId = binHeader2.SeqId
+	}
+	if SeqId == 0 {
+		SeqId = 1
+	}
+
+	if errors.Is(err1, ErrBinHeader) {
+		salt := newByteSlice(64)
+		_, err := rand.Read(salt)
+		if err != nil {
+			log.Fatal(err)
+		}
+		binHeader1 = LUKSBinaryHeader{
+			Magic:        [6]byte([]byte(magic2nd)),
+			HeaderNumber: 1,
+			Version:      2,
+			HdrSize:      uint64(minHeaderSize), // TODO: Calculate the header from the JSON header offset and size
+			SeqId:        SeqId,
+			CheckSumAlgo: algoSHA256,
+			Salt:         [64]byte(salt),
+			UUID:         luksDiskUUID,
+		}
+		binHeader1.CheckSum = calcCheckSum(append(binHeader1.ToRaw(), jsonHeader.Raw...), algoSHA256)
+		if !isChecksumValid(binHeader1, jsonHeader) {
+			log.Fatalln("Checksum of newly created first binary header is not valid")
+		}
+	}
+
+	if errors.Is(err2, ErrBinHeader) {
+		salt := newByteSlice(64)
+		_, err := rand.Read(salt)
+		if err != nil {
+			log.Fatal(err)
+		}
+		binHeader2 = LUKSBinaryHeader{
+			Magic:        [6]byte([]byte(magic2nd)),
+			HeaderNumber: 2,
+			Version:      2,
+			HdrSize:      uint64(minHeaderSize), // TODO: Calculate the header from the JSON header offset and size
+			SeqId:        SeqId,
+			CheckSumAlgo: algoSHA256,
+			Salt:         [64]byte(salt),
+			UUID:         luksDiskUUID,
+		}
+		binHeader2.CheckSum = calcCheckSum(append(binHeader2.ToRaw(), jsonHeader.Raw...), algoSHA256)
+		if !isChecksumValid(binHeader2, jsonHeader) {
+			log.Fatalln("Checksum of newly created second binary header is not valid")
+		}
+	}
+
+	// Write the headers to the file
+
 }
 
-// func calculateChecksum(data []byte) []byte {
+// func signBinHeader(binHeader LUKSBinaryHeader, jsonHeader LUKSJSONHeader, changeSalt bool) [64]byte {
+// 	curSalt := byteSlice(binHeader.Salt[:])
+// 	if changeSalt || curSalt.ToStr() == "" {
+// 		newSalt := newByteSlice(64)
+// 		_, err := rand.Read(newSalt)
+// 		if err != nil {
+// 			log.Fatal(err)
+// 		}
+// 		binHeader.Salt = [64]byte(newSalt)
+// 	}
+// 	unsignedRaw := newHeader.ToRaw()
+
 // }
 
 func readHeaders(file *fileReader, headerOffset int64) (LUKSBinaryHeader, LUKSJSONHeader, error) {
@@ -384,6 +460,25 @@ func readHeaders(file *fileReader, headerOffset int64) (LUKSBinaryHeader, LUKSJS
 	}
 
 	return binHeader, jsonHeader, resErr
+}
+
+func calcCheckSum(rawData []byte, algo string) [64]byte {
+	// Zero checksum in the raw data
+	copy(rawData[448:513], make([]byte, 64))
+
+	var res [64]byte
+
+	switch algo {
+	case algoSHA256:
+		csum := sha256.Sum256(rawData)
+		copy(res[:], csum[:])
+	default:
+		// TODO: Implement other checksum algorithms
+		fmt.Printf("Checksum algorithm '%s' is not supported\n", algo)
+		fmt.Printf("Supported algorithms: '%s'\n", algoSHA256)
+	}
+
+	return res
 }
 
 func isChecksumValid(binHeader LUKSBinaryHeader, jsonHeader LUKSJSONHeader) bool {
