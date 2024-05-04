@@ -133,6 +133,10 @@ func (h LUKSBinaryHeader) ToRaw() []byte {
 
 type byteSlice []byte
 
+func newByteSlice(size int) byteSlice {
+	return make([]byte, size)
+}
+
 func (b byteSlice) ToStr() string {
 	res := make([]byte, 0, len(b))
 	for _, v := range b {
@@ -142,6 +146,10 @@ func (b byteSlice) ToStr() string {
 		res = append(res, v)
 	}
 	return string(res)
+}
+
+func (b byteSlice) ToHEX() string {
+	return fmt.Sprintf("%x", b)
 }
 
 type LUKSJSONHeader struct {
@@ -283,6 +291,8 @@ func main() {
 		log.Println("WARN: First JSON header not found")
 	}
 
+	return
+
 	hdr1Sizes := make([]uint64, 0, len(possibleHeaderOffset))
 	if binHeader1.Version == 2 && binHeader1.HdrSize > 0 {
 		hdr1Sizes = append(hdr1Sizes, binHeader1.HdrSize)
@@ -380,17 +390,27 @@ func isChecksumValid(binHeader LUKSBinaryHeader, jsonHeader LUKSJSONHeader) bool
 	expectedCheckSum := binHeader.CheckSum
 
 	binHeader.CheckSum = [64]byte{} // Zero out the checksum
-	var actualCheckSum [64]byte
+	actualCheckSum := newByteSlice(64)
 
 	// Check sum algorithm
 	if binHeader.CheckSumAlgo == algoSHA256 {
 		binHeaderRaw := binHeader.ToRaw()
 		binHeaderRaw = append(binHeaderRaw, make([]byte, jsonOffset-len(binHeaderRaw))...)
 		jsonHeaderRaw := jsonHeader.Raw
-		jsonHeaderRaw = append(jsonHeaderRaw, make([]byte, binHeader.HdrSize-uint64(len(jsonHeaderRaw)))...)
+		jsonHeaderRaw = append(jsonHeaderRaw, make([]byte, binHeader.HdrSize-uint64(len(jsonHeaderRaw))-uint64(len(binHeaderRaw)))...)
 		fmt.Printf("Bin header len: %d\n", len(binHeaderRaw))
 		fmt.Printf("JSON header len: %d\n", len(jsonHeaderRaw))
-		checkSum := sha256.Sum256(append(binHeaderRaw, jsonHeaderRaw...))
+		fullRawHeader := append(binHeaderRaw, jsonHeaderRaw...)
+
+		// Write the header to file
+		// headerFile, err := os.Create("../raw_header")
+		// if err != nil {
+		// 	log.Fatal(err)
+		// }
+		// headerFile.Write(fullRawHeader)
+		// headerFile.Close()
+
+		checkSum := sha256.Sum256(fullRawHeader)
 		copy(actualCheckSum[:], checkSum[:])
 	} else {
 		fmt.Printf("Checksum algorithm '%s' is not supported\n", binHeader.CheckSumAlgo)
