@@ -129,6 +129,10 @@ func (h LUKSBinaryHeader) ToRaw() []byte {
 	copy(raw[264:448], make([]byte, 184))                 // Zeroed 184 bytes
 	copy(raw[448:binHeaderLen], h.CheckSum[:])            // CheckSum is 64 bytes
 
+	if len(raw) < jsonOffset {
+		raw = append(raw, make([]byte, jsonOffset-len(raw))...)
+	}
+
 	return raw
 }
 
@@ -180,6 +184,14 @@ func (h LUKSJSONHeader) String() string {
 
 	return fmt.Sprintf("JSON Header:\n\tConfig: %s\n\tDigests: %s\n\tKeySlots: %s\n\tSegments: %s\n\tTokens: %s\n",
 		h.Config, digests, keySlots, segments, h.Tokens)
+}
+
+func (h LUKSJSONHeader) ToRaw(size int) []byte {
+	if len(h.Raw) < size {
+		return append(h.Raw, make([]byte, int(size)-len(h.Raw))...)
+	}
+
+	return h.Raw
 }
 
 type ConfigS struct {
@@ -364,7 +376,7 @@ func main() {
 			log.Fatal(err)
 		}
 		binHeader1 = LUKSBinaryHeader{
-			Magic:        [6]byte([]byte(magic2nd)),
+			Magic:        [6]byte([]byte(magic1st)),
 			HeaderNumber: 1,
 			Version:      2,
 			HdrSize:      uint64(minHeaderSize), // TODO: Calculate the header from the JSON header offset and size
@@ -373,7 +385,9 @@ func main() {
 			Salt:         [64]byte(salt),
 			UUID:         luksDiskUUID,
 		}
-		binHeader1.CheckSum = calcCheckSum(append(binHeader1.ToRaw(), jsonHeader.Raw...), algoSHA256)
+		binHeaderRaw := binHeader1.ToRaw()
+		jsonHeaderRaw := jsonHeader.ToRaw(int(binHeader1.HdrSize) - len(binHeaderRaw))
+		binHeader1.CheckSum = calcCheckSum(append(binHeaderRaw, jsonHeaderRaw...), algoSHA256)
 		if !isChecksumValid(binHeader1, jsonHeader) {
 			log.Fatalln("Checksum of newly created first binary header is not valid")
 		}
@@ -395,14 +409,27 @@ func main() {
 			Salt:         [64]byte(salt),
 			UUID:         luksDiskUUID,
 		}
-		binHeader2.CheckSum = calcCheckSum(append(binHeader2.ToRaw(), jsonHeader.Raw...), algoSHA256)
+		binHeaderRaw := binHeader2.ToRaw()
+		jsonHeaderRaw := jsonHeader.ToRaw(int(binHeader2.HdrSize) - len(binHeaderRaw))
+		binHeader2.CheckSum = calcCheckSum(append(binHeaderRaw, jsonHeaderRaw...), algoSHA256)
 		if !isChecksumValid(binHeader2, jsonHeader) {
 			log.Fatalln("Checksum of newly created second binary header is not valid")
 		}
 	}
 
-	// Write the headers to the file
+	repairedData := append(binHeader1.ToRaw(), jsonHeader.ToRaw(int(binHeader1.HdrSize)-len(binHeader1.ToRaw()))...)
+	repairedData = append(repairedData, binHeader2.ToRaw()...)
+	repairedData = append(repairedData, jsonHeader.ToRaw(int(binHeader2.HdrSize)-len(binHeader2.ToRaw()))...)
 
+	// Write the headers to the file
+	headerFile, err := os.Create("../repaired_header")
+	if err != nil {
+		log.Fatal(err)
+	}
+	headerFile.Write(repairedData)
+	headerFile.Close()
+
+	fmt.Println("Headers are restored successfully")
 }
 
 // func signBinHeader(binHeader LUKSBinaryHeader, jsonHeader LUKSJSONHeader, changeSalt bool) [64]byte {
@@ -463,8 +490,22 @@ func readHeaders(file *fileReader, headerOffset int64) (LUKSBinaryHeader, LUKSJS
 }
 
 func calcCheckSum(rawData []byte, algo string) [64]byte {
+	// headerFile, err := os.Create("../raw_header")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// headerFile.Write(rawData)
+	// headerFile.Close()
+
 	// Zero checksum in the raw data
 	copy(rawData[448:513], make([]byte, 64))
+
+	// headerFile, err = os.Create("../raw_header_zeroed")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// headerFile.Write(rawData)
+	// headerFile.Close()
 
 	var res [64]byte
 
@@ -478,6 +519,13 @@ func calcCheckSum(rawData []byte, algo string) [64]byte {
 		fmt.Printf("Supported algorithms: '%s'\n", algoSHA256)
 	}
 
+	// headerFile, err = os.Create("../raw_header_csum")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// headerFile.Write(res[:])
+	// headerFile.Close()
+
 	return res
 }
 
@@ -490,11 +538,9 @@ func isChecksumValid(binHeader LUKSBinaryHeader, jsonHeader LUKSJSONHeader) bool
 	// Check sum algorithm
 	if binHeader.CheckSumAlgo == algoSHA256 {
 		binHeaderRaw := binHeader.ToRaw()
-		binHeaderRaw = append(binHeaderRaw, make([]byte, jsonOffset-len(binHeaderRaw))...)
-		jsonHeaderRaw := jsonHeader.Raw
-		jsonHeaderRaw = append(jsonHeaderRaw, make([]byte, binHeader.HdrSize-uint64(len(jsonHeaderRaw))-uint64(len(binHeaderRaw)))...)
-		fmt.Printf("Bin header len: %d\n", len(binHeaderRaw))
-		fmt.Printf("JSON header len: %d\n", len(jsonHeaderRaw))
+		jsonHeaderRaw := jsonHeader.ToRaw(int(binHeader.HdrSize) - len(binHeaderRaw))
+		// fmt.Printf("Bin header len: %d\n", len(binHeaderRaw))
+		// fmt.Printf("JSON header len: %d\n", len(jsonHeaderRaw))
 		fullRawHeader := append(binHeaderRaw, jsonHeaderRaw...)
 
 		// Write the header to file

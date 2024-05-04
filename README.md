@@ -36,3 +36,11 @@ $ sudo cryptsetup luksHeaderRestore /dev/sdX --header-backup-file /path/to/backu
 $ openssl dgst -sha256 -binary ./file_name > output_file
 ```
 
+
+
+#### To replace part of a binary file content with content from another file
+
+```sh
+$ dd if=smallerFile of=largerFile bs=1 count=32768 conv=notrunc
+```
+
