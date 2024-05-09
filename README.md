@@ -44,3 +44,31 @@ $ openssl dgst -sha256 -binary ./file_name > output_file
 $ dd if=smallerFile of=largerFile bs=1 count=32768 conv=notrunc
 ```
 
+
+
+#### TMPFS
+
+```sh
+$ sudo mkdir /tmp/ramdisk
+$ sudo chmod 777 /tmp/ramdisk
+$ sudo mount -t tmpfs -o size=2G myramdisk /tmp/ramdisk
+```
+
+
+
+#### cryptsetup tests
+
+```sh
+$ sudo dd if=/dev/zero of=/tmp/ramdisk/disk1 bs=512 count=200000
+$ echo "111" > /tmp/ramdisk/disk1_pass
+$ sudo cryptsetup luksFormat --batch-mode --header /tmp/ramdisk/disk1_header /tmp/ramdisk/disk1 /tmp/ramdisk/disk1_pass
+$ sudo cryptsetup open --header /tmp/ramdisk/disk1_header /tmp/ramdisk/disk1 disk1_enc --key-file /tmp/ramdisk/disk1_pass
+$ sudo mkfs.ext4 /dev/mapper/disk1_enc
+$ sudo mount /dev/mapper/disk1_enc /mnt/disk1_enc
+$ echo "test data" | sudo tee /mnt/disk1_enc/test
+# OR
+$ sudo chmod 777 /mnt/disk1_enc/test && echo "test data" > /mnt/disk1_enc/test
+$ sudo umount /mnt/disk1_enc
+$ sudo cryptsetup close /dev/mapper/disk1_enc
+```
+
