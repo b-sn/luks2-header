@@ -6,7 +6,7 @@
 $ sudo dd if=/dev/sdX of=/path/to/backupfile bs=512 count=4096
 ```
 
-- Using `cryptsetup`
+- Using [cryptsetup](https://gitlab.com/cryptsetup/cryptsetup)
 
 ```sh
 $ sudo cryptsetup luksHeaderBackup /dev/sdX --header-backup-file /path/to/backupfile
